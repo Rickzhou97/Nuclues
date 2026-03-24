@@ -8,6 +8,7 @@ Never crashes — all errors are caught and logged.
 import os
 import json
 import logging
+import time
 import traceback
 from datetime import datetime, timezone
 
@@ -126,25 +127,41 @@ def ethos_headers() -> dict:
     }
 
 
+def _ethos_request(method: str, path: str, **kwargs) -> dict:
+    """Make a request to Ethos with one automatic retry on timeout (Vercel cold start)."""
+    url = f"{ETHOS_BASE_URL}{path}"
+    for attempt in range(2):
+        try:
+            resp = ethos_session.request(method, url, headers=ethos_headers(), timeout=45, **kwargs)
+            resp.raise_for_status()
+            return resp.json()
+        except requests.Timeout:
+            if attempt == 0:
+                log.warning(f"Ethos timeout on {method} {path} — retrying after 3s (Vercel cold start)")
+                time.sleep(3)
+            else:
+                raise
+    raise RuntimeError("unreachable")
+
+
+def warm_ethos():
+    """Ping Ethos health endpoint to wake Vercel before making CRM calls."""
+    try:
+        ethos_session.get(f"{ETHOS_BASE_URL}/api/health", timeout=20)
+    except Exception:
+        pass  # Health ping failure is fine — we'll retry on the real call
+
+
 def ethos_get(path: str, params: dict = None) -> dict:
-    """GET from Ethos — read-only lookup."""
-    resp = ethos_session.get(f"{ETHOS_BASE_URL}{path}", headers=ethos_headers(), params=params, timeout=30)
-    resp.raise_for_status()
-    return resp.json()
+    return _ethos_request("GET", path, params=params)
 
 
 def ethos_post(path: str, body: dict) -> dict:
-    """POST to Ethos — create only."""
-    resp = ethos_session.post(f"{ETHOS_BASE_URL}{path}", headers=ethos_headers(), json=body, timeout=30)
-    resp.raise_for_status()
-    return resp.json()
+    return _ethos_request("POST", path, json=body)
 
 
 def ethos_patch(path: str, body: dict) -> dict:
-    """PATCH to Ethos — update existing record."""
-    resp = ethos_session.patch(f"{ETHOS_BASE_URL}{path}", headers=ethos_headers(), json=body, timeout=30)
-    resp.raise_for_status()
-    return resp.json()
+    return _ethos_request("PATCH", path, json=body)
 
 
 def find_or_create_prospect(company_name: str, contact_name: str, notes: str) -> str:
@@ -300,6 +317,7 @@ def webhook():
                 log.warning("ETHOS_API_URL not set — skipping CRM post.")
             else:
                 try:
+                    warm_ethos()  # Wake Vercel before chained CRM calls
                     post_to_ethos(payload, classification)
                     log.info(f"Posted to ETHOS CRM | category={category!r}")
                 except requests.HTTPError as exc:
