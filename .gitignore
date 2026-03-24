@@ -1,0 +1,17 @@
+# Secrets — never commit
+.env
+
+# WhatsApp session data — contains auth tokens
+*.data.json
+_IGNORE_*/
+
+# Logs
+agent.log
+*.log
+
+# Dependencies
+node_modules/
+
+# Python
+__pycache__/
+*.pyc

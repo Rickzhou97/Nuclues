@@ -1,0 +1,13 @@
+{
+  "name": "nucleus-whatsapp-agent",
+  "version": "1.0.0",
+  "description": "WhatsApp CRM bridge — forwards group messages to agent.py",
+  "main": "whatsapp.js",
+  "scripts": {
+    "start": "node whatsapp.js"
+  },
+  "dependencies": {
+    "axios": "^1.13.6",
+    "dotenv": "^16.0.0"
+  }
+}
