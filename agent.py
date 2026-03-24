@@ -20,7 +20,7 @@ from flask import Flask, request, jsonify
 load_dotenv()
 
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
-ETHOS_API_URL     = os.getenv("ETHOS_API_URL", "")
+ETHOS_BASE_URL    = os.getenv("ETHOS_API_URL", "").rstrip("/").removesuffix("/api/crm/records")
 ETHOS_API_KEY     = os.getenv("ETHOS_API_KEY", "")
 CRM_THRESHOLD     = float(os.getenv("CRM_THRESHOLD", "0.75"))
 PORT              = int(os.getenv("AGENT_PORT", "8000"))
@@ -39,6 +39,9 @@ log = logging.getLogger(__name__)
 
 # ── Claude client ───────────────────────────────────────────────────────────────
 claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+
+# ── Ethos HTTP session ───────────────────────────────────────────────────────────
+ethos_session = requests.Session()
 
 # ── Flask app ───────────────────────────────────────────────────────────────────
 app = Flask(__name__)
@@ -114,42 +117,142 @@ def classify_message(sender: str, body: str) -> dict:
     return json.loads(raw)
 
 
-# ── ETHOS CRM post ──────────────────────────────────────────────────────────────
-def post_to_ethos(payload: dict, classification: dict) -> bool:
-    """POST a CRM record to ETHOS. Returns True on success.
-    Strictly uses POST only — never GET/PUT/PATCH/DELETE regardless of config.
-    """
-    # Safety guard: only allow the configured base URL, never derived paths
-    safe_url = ETHOS_API_URL.rstrip("/")
-    if not safe_url.startswith("http"):
-        raise ValueError(f"ETHOS_API_URL looks invalid: {safe_url!r}")
-
-    crm_record = {
-        "source":       "whatsapp",
-        "platform":     "NUCLEUS",
-        "sender":       payload.get("sender"),
-        "group":        payload.get("group"),
-        "message":      payload.get("body"),
-        "timestamp":    payload.get("timestamp"),
-        "category":     classification.get("category"),
-        "confidence":   classification.get("confidence"),
-        "contact_name": classification.get("contact_name"),
-        "company_name": classification.get("company_name"),
-        "value":        classification.get("value"),
-        "summary":      classification.get("summary"),
-        "received_at":  datetime.now(timezone.utc).isoformat(),
+# ── ETHOS API helpers ────────────────────────────────────────────────────────────
+def ethos_headers() -> dict:
+    return {
+        "Authorization": f"Bearer {ETHOS_API_KEY}",
+        "Content-Type":  "application/json",
+        "User-Agent":    "NUCLEUS-CRM-Agent/1.0",
     }
-    resp = requests.post(
-        ETHOS_API_URL,
-        json=crm_record,
-        headers={
-            "Authorization": f"Bearer {ETHOS_API_KEY}",
-            "Content-Type":  "application/json",
-        },
-        timeout=15,
-    )
+
+
+def ethos_get(path: str, params: dict = None) -> dict:
+    """GET from Ethos — read-only lookup."""
+    resp = ethos_session.get(f"{ETHOS_BASE_URL}{path}", headers=ethos_headers(), params=params, timeout=30)
     resp.raise_for_status()
-    return True
+    return resp.json()
+
+
+def ethos_post(path: str, body: dict) -> dict:
+    """POST to Ethos — create only."""
+    resp = ethos_session.post(f"{ETHOS_BASE_URL}{path}", headers=ethos_headers(), json=body, timeout=30)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def ethos_patch(path: str, body: dict) -> dict:
+    """PATCH to Ethos — update existing record."""
+    resp = ethos_session.patch(f"{ETHOS_BASE_URL}{path}", headers=ethos_headers(), json=body, timeout=30)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def find_or_create_prospect(company_name: str, contact_name: str, notes: str) -> str:
+    """Return existing prospect ID or create a new one. Returns prospect ID."""
+    result = ethos_get("/api/nucleus/prospects", {"search": company_name, "limit": 5})
+    prospects = result.get("data", [])
+    if prospects:
+        match = prospects[0]
+        log.info(f"Found existing prospect: {match['companyName']} ({match['id']})")
+        return match["id"]
+
+    new_prospect = ethos_post("/api/nucleus/prospects", {
+        "companyName": company_name,
+        "contactName": contact_name,
+        "source":      "WHATSAPP",
+        "notes":       notes,
+    })
+    pid = new_prospect["data"]["id"]
+    log.info(f"Created new prospect: {company_name} ({pid})")
+    return pid
+
+
+def find_existing_opportunity(prospect_id: str, company_name: str) -> str | None:
+    """Return the most recent active opportunity ID for this prospect, or None."""
+    try:
+        result = ethos_get("/api/nucleus/opportunities", {
+            "prospectId": prospect_id,
+            "status": "ACTIVE_LEAD",
+            "limit": 5,
+        })
+        opps = result.get("data", [])
+        if opps:
+            match = opps[0]
+            log.info(f"Found existing opportunity: {match['name']} ({match['id']}) for {company_name}")
+            return match["id"]
+    except Exception as exc:
+        log.warning(f"Could not search opportunities: {exc}")
+    return None
+
+
+def post_to_ethos(payload: dict, classification: dict) -> str:
+    """Route the classification to the correct Ethos endpoint. Returns a status string."""
+    if not ETHOS_BASE_URL or not ETHOS_BASE_URL.startswith("http"):
+        raise ValueError("ETHOS_API_URL is not configured correctly")
+
+    category     = classification.get("category", "none")
+    company_name = classification.get("company_name")
+    contact_name = classification.get("contact_name")
+    value        = classification.get("value")
+    summary      = classification.get("summary", "")
+    sender       = payload.get("sender", "unknown")
+    body         = payload.get("body", "")
+    notes        = f"Via WhatsApp from {sender}: {body}"
+
+    if category == "NEW_CONTACT":
+        if not company_name:
+            return "skipped — no company name extracted"
+        ethos_post("/api/nucleus/prospects", {
+            "companyName": company_name,
+            "contactName": contact_name,
+            "source":      "WHATSAPP",
+            "notes":       notes,
+        })
+        return f"prospect created: {company_name}"
+
+    elif category == "NEW_OPPORTUNITY":
+        if not company_name:
+            return "skipped — no company name extracted"
+        prospect_id = find_or_create_prospect(company_name, contact_name, notes)
+        ethos_post("/api/nucleus/opportunities", {
+            "prospectId":    prospect_id,
+            "name":          summary or f"Opportunity — {company_name}",
+            "description":   body,
+            "estimatedValue": value,
+            "contactPerson": contact_name,
+            "leadSource":    "WHATSAPP",
+            "notes":         notes,
+        })
+        return f"opportunity created for {company_name}"
+
+    elif category in ("QUOTE_UPDATE", "MEETING_NOTE", "FOLLOW_UP", "ORDER_UPDATE"):
+        if not company_name:
+            return f"{category} logged locally only (no company name)"
+        try:
+            prospect_id = find_or_create_prospect(company_name, contact_name, notes)
+            opp_id = find_existing_opportunity(prospect_id, company_name)
+
+            if opp_id:
+                # Append note to the existing opportunity thread
+                update_note = f"[{category}] {summary or body}"
+                ethos_patch(f"/api/nucleus/opportunities/{opp_id}", {"notes": update_note})
+                return f"{category} appended to existing opportunity for {company_name}"
+            else:
+                # No active opportunity found — create a new one as a thread record
+                ethos_post("/api/nucleus/opportunities", {
+                    "prospectId":    prospect_id,
+                    "name":          f"[{category}] {summary or body[:60]}",
+                    "description":   body,
+                    "contactPerson": contact_name,
+                    "leadSource":    "WHATSAPP",
+                    "notes":         notes,
+                })
+                return f"{category} logged as new opportunity for {company_name}"
+        except Exception as exc:
+            log.warning(f"Could not log {category} to Ethos: {exc}")
+            return f"{category} failed to post: {exc}"
+
+    return f"no Ethos action for category={category}"
 
 
 # ── Webhook endpoint ────────────────────────────────────────────────────────────
@@ -193,7 +296,7 @@ def webhook():
 
         # ── Step 3: Post to ETHOS if above threshold ───────────────────────────
         if is_crm and confidence >= CRM_THRESHOLD:
-            if not ETHOS_API_URL:
+            if not ETHOS_BASE_URL:
                 log.warning("ETHOS_API_URL not set — skipping CRM post.")
             else:
                 try:
@@ -227,5 +330,5 @@ def health():
 if __name__ == "__main__":
     log.info(f"Nucleus WhatsApp CRM Agent starting on port {PORT}")
     log.info(f"CRM confidence threshold: {CRM_THRESHOLD}")
-    log.info(f"ETHOS CRM URL: {ETHOS_API_URL or '(not set)'}")
+    log.info(f"ETHOS CRM URL: {ETHOS_BASE_URL or '(not set)'}")
     app.run(host="0.0.0.0", port=PORT, debug=False)
